@@ -1,4 +1,5 @@
 fastapi
 uvicorn
-GitPython
 pydantic
+httpx
+pytest
