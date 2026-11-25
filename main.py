@@ -3,7 +3,7 @@ import os
 from typing import Optional
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, Response, Security
 from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
@@ -14,6 +14,7 @@ from github_storage import (
     ScopeType,
     render_entries_markdown,
 )
+from mcp_server import handle_jsonrpc_message
 
 app = FastAPI(
     title="Yggdrasil Memory API — Project Cosmos",
@@ -203,3 +204,19 @@ async def search_memories(
         "query": q,
         "results": [entry.model_dump() for entry in results],
     }
+
+
+@app.post("/mcp", summary="Remote Streamable HTTP MCP endpoint")
+async def remote_mcp_endpoint(
+    payload: dict = Body(...),
+    api_key: str = Security(api_key_header),
+    _allowed_scopes: set[str] = Depends(resolve_read_scopes),
+):
+    """Handle MCP JSON-RPC 2.0 requests over HTTP for web and mobile AI connectors."""
+    raw_token = api_key[7:] if api_key.startswith("Bearer ") else api_key
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://yggdrasil") as client:
+        response = await handle_jsonrpc_message(payload, client=client, api_key=raw_token)
+    if response is None:
+        return Response(status_code=202)
+    return response

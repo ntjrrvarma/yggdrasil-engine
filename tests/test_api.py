@@ -210,6 +210,80 @@ class TestYggdrasilAPI(unittest.TestCase):
         )
         self.assertEqual(res.status_code, 502)
 
+    def test_remote_mcp_http_endpoint(self):
+        main.API_KEY = "admin-secret"
+        main.PUBLIC_READ_KEY = "public-twin-key"
+        mock_storage = make_mock_storage()
+        main.get_storage = lambda: mock_storage
+        client = TestClient(main.app)
+
+        # Unauthenticated MCP request is rejected
+        unauth = client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        )
+        self.assertIn(unauth.status_code, (401, 403))
+
+        # Initialize & tools/list
+        init_res = client.post(
+            "/mcp",
+            headers={"Authorization": "Bearer admin-secret"},
+            json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        )
+        self.assertEqual(init_res.status_code, 200)
+        self.assertEqual(
+            init_res.json()["result"]["serverInfo"]["name"], "yggdrasil-cosmos-mcp"
+        )
+
+        # Notification returns 202
+        notif_res = client.post(
+            "/mcp",
+            headers={"Authorization": "Bearer admin-secret"},
+            json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        )
+        self.assertEqual(notif_res.status_code, 202)
+
+        # commit_to_memory & recall_memory over HTTP /mcp
+        add_res = client.post(
+            "/mcp",
+            headers={"Authorization": "Bearer admin-secret"},
+            json={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "commit_to_memory",
+                    "arguments": {
+                        "tag": "remote-mcp",
+                        "summary": "Claude, ChatGPT, and Gemini share one brain.",
+                        "source_agent": "ChatGPT-Connector",
+                        "scope": "career-public",
+                    },
+                },
+            },
+        )
+        self.assertEqual(add_res.status_code, 200)
+        self.assertFalse(add_res.json()["result"]["isError"])
+
+        recall_res = client.post(
+            "/mcp",
+            headers={"Authorization": "Bearer public-twin-key"},
+            json={
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "recall_memory",
+                    "arguments": {"tag": "remote-mcp"},
+                },
+            },
+        )
+        self.assertEqual(recall_res.status_code, 200)
+        self.assertIn(
+            "Claude, ChatGPT, and Gemini share one brain.",
+            recall_res.json()["result"]["content"][0]["text"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
