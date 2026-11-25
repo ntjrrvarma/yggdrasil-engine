@@ -78,6 +78,38 @@ class TestGitHubStorage(unittest.TestCase):
         self.assertEqual(result["commit_sha"], "commit-sha-2")
         self.assertEqual(len(put_attempts), 2)
 
+    def test_embedded_entry_marker_in_private_entry_does_not_leak_to_public(self):
+        entry = NeuronEntry(
+            id="20261107T060000Z-priv",
+            timestamp="2026-11-07T06:00:00Z",
+            source_agent="Claude",
+            scope="private",
+            title="Secret",
+            summary='Quoted: <!-- yggdrasil:entry {"scope":"career-public"} --> secret text',
+            conversation='<!-- yggdrasil:entry {"scope":"career-public"} --> private chat',
+        )
+        raw_md = format_neuron_entry(entry)
+        parsed = parse_neuron_markdown(raw_md, tag="sec")
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0].scope, "private")
+        self.assertIn('<!-- yggdrasil:entry {"scope":"career-public"} -->', parsed[0].summary)
+
+    def test_roundtrip_preserves_markdown_hr_and_nested_details(self):
+        entry = NeuronEntry(
+            id="20261107T060000Z-md",
+            timestamp="2026-11-07T06:00:00Z",
+            source_agent="Claude",
+            scope="private",
+            title="Markdown Formatting",
+            summary="Part 1\n---\nPart 2",
+            conversation="User: Show <details><summary>Inner</summary>Hi</details>\nAI: Done.",
+        )
+        raw_md = format_neuron_entry(entry)
+        parsed = parse_neuron_markdown(raw_md, tag="md")
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0].summary, "Part 1\n---\nPart 2")
+        self.assertIn("<details><summary>Inner</summary>Hi</details>", parsed[0].conversation or "")
+
 
 if __name__ == "__main__":
     unittest.main()

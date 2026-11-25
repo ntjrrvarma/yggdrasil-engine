@@ -12,14 +12,23 @@ ScopeType = Literal["private", "career-public", "commercial"]
 ALL_SCOPES: set[str] = {"private", "career-public", "commercial"}
 
 ENTRY_MARKER_RE = re.compile(r"<!--\s*yggdrasil:entry\s+(\{.*?\})\s*-->")
-DETAILS_RE = re.compile(
-    r"<details>\s*<summary>Full Topic Conversation</summary>\s*(.*?)\s*</details>",
+OUTER_DETAILS_RE = re.compile(
+    r"\n?<details>\s*<summary>Full Topic Conversation</summary>\s*(.*)\s*</details>\s*\Z",
     re.DOTALL,
 )
 SUMMARY_SECTION_RE = re.compile(
-    r"### Distilled Summary\s*\n(.*?)(?=\n<details>|\n---|\Z)",
+    r"### Distilled Summary\s*\n(.*)\Z",
     re.DOTALL,
 )
+
+
+def _escape_embedded_comments(text: str) -> str:
+    """Prevent user text containing HTML comments from spoofing entry boundaries."""
+    return text.replace("<!--", "&lt;!--")
+
+
+def _unescape_embedded_comments(text: str) -> str:
+    return text.replace("&lt;!--", "<!--")
 
 
 class NeuronEntry(BaseModel):
@@ -71,7 +80,7 @@ def format_neuron_entry(entry: NeuronEntry) -> str:
         f"- **Source:** `{entry.source_agent}` | **Scope:** `{entry.scope}`",
         "",
         "### Distilled Summary",
-        entry.summary.strip(),
+        _escape_embedded_comments(entry.summary.strip()),
     ]
 
     if entry.conversation and entry.conversation.strip():
@@ -81,7 +90,7 @@ def format_neuron_entry(entry: NeuronEntry) -> str:
                 "<details>",
                 "<summary>Full Topic Conversation</summary>",
                 "",
-                entry.conversation.strip(),
+                _escape_embedded_comments(entry.conversation.strip()),
                 "</details>",
             ]
         )
@@ -136,20 +145,26 @@ def parse_neuron_markdown(
         block_start = match.end()
         block_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(markdown)
         body = markdown[block_start:block_end].strip()
+        body = re.sub(r"\n---\s*\Z", "", body).strip()
 
         try:
             meta = json.loads(raw_meta)
         except json.JSONDecodeError:
             meta = {}
 
-        conv_match = DETAILS_RE.search(body)
-        conversation = conv_match.group(1).strip() if conv_match else None
+        conv_match = OUTER_DETAILS_RE.search(body)
+        conversation = (
+            _unescape_embedded_comments(conv_match.group(1).strip())
+            if conv_match
+            else None
+        )
+        body_without_conv = OUTER_DETAILS_RE.sub("", body).strip()
 
-        sum_match = SUMMARY_SECTION_RE.search(body)
+        sum_match = SUMMARY_SECTION_RE.search(body_without_conv)
         if sum_match:
-            summary = sum_match.group(1).strip()
+            summary = _unescape_embedded_comments(sum_match.group(1).strip())
         else:
-            summary = DETAILS_RE.sub("", body).strip()
+            summary = _unescape_embedded_comments(body_without_conv)
 
         scope_val = meta.get("scope", "private")
         if scope_val not in ALL_SCOPES:
@@ -235,7 +250,8 @@ class GitHubStorage:
         raw_b64 = data.get("content", "")
         decoded = base64.b64decode(raw_b64).decode("utf-8") if raw_b64 else ""
         sha = data.get("sha")
-        self._cache[path] = (now, decoded, sha or "")
+        if use_cache:
+            self._cache[path] = (now, decoded, sha or "")
         return decoded, sha
 
     async def append_entry(
@@ -304,7 +320,9 @@ class GitHubStorage:
 
         raise RuntimeError(f"Failed to commit memory to {path} after SHA conflict retry")
 
-    async def list_tags(self) -> list[dict[str, Any]]:
+    async def list_tags(
+        self, allowed_scopes: Optional[set[str]] = None
+    ) -> list[dict[str, Any]]:
         async with self._client() as client:
             tree_url = f"/repos/{self.user}/{self.repo}/git/trees/HEAD?recursive=1"
             resp = await client.get(tree_url)
@@ -316,6 +334,10 @@ class GitHubStorage:
                         parts = path[:-3].split("/")
                         tag_name = parts[-1]
                         realm_name = parts[0] if len(parts) > 1 else None
+                        try:
+                            sanitize_slug(tag_name)
+                        except ValueError:
+                            continue
                         items.append(
                             {
                                 "tag": tag_name,
@@ -324,25 +346,43 @@ class GitHubStorage:
                                 "size": node.get("size", 0),
                             }
                         )
-                return items
+            else:
+                # Fallback to root /contents
+                c_resp = await client.get(f"/repos/{self.user}/{self.repo}/contents")
+                if c_resp.status_code == 404:
+                    return []
+                c_resp.raise_for_status()
+                for item in c_resp.json():
+                    path = item.get("path", "")
+                    if item.get("type") == "file" and path.endswith(".md"):
+                        tag_name = path[:-3]
+                        try:
+                            sanitize_slug(tag_name)
+                        except ValueError:
+                            continue
+                        items.append(
+                            {
+                                "tag": tag_name,
+                                "realm": None,
+                                "path": path,
+                                "size": item.get("size", 0),
+                            }
+                        )
 
-            # Fallback to root /contents
-            c_resp = await client.get(f"/repos/{self.user}/{self.repo}/contents")
-            if c_resp.status_code == 404:
-                return []
-            c_resp.raise_for_status()
-            for item in c_resp.json():
-                path = item.get("path", "")
-                if item.get("type") == "file" and path.endswith(".md"):
-                    items.append(
-                        {
-                            "tag": path[:-3],
-                            "realm": None,
-                            "path": path,
-                            "size": item.get("size", 0),
-                        }
-                    )
-            return items
+        if allowed_scopes is not None and allowed_scopes != ALL_SCOPES:
+            visible: list[dict[str, Any]] = []
+            for item in items:
+                entries = await self.read_entries(
+                    tag=item["tag"],
+                    realm=item.get("realm"),
+                    allowed_scopes=allowed_scopes,
+                    include_conversation=False,
+                )
+                if entries:
+                    visible.append(item)
+            return visible
+
+        return items
 
     async def read_entries(
         self,
@@ -379,6 +419,7 @@ class GitHubStorage:
         query: str,
         allowed_scopes: set[str],
         tag: Optional[str] = None,
+        realm: Optional[str] = None,
         scope_filter: Optional[str] = None,
         limit: int = 10,
     ) -> list[NeuronEntry]:
@@ -386,8 +427,14 @@ class GitHubStorage:
         if not tokens:
             return []
 
-        if tag:
-            candidate_tags = [{"tag": sanitize_slug(tag), "realm": None}]
+        if tag and realm and realm.strip():
+            candidate_tags = [{"tag": sanitize_slug(tag), "realm": sanitize_slug(realm)}]
+        elif tag:
+            target_slug = sanitize_slug(tag)
+            all_tags = await self.list_tags()
+            candidate_tags = [
+                item for item in all_tags if sanitize_slug(item["tag"]) == target_slug
+            ]
         else:
             candidate_tags = await self.list_tags()
 
