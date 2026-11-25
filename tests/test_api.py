@@ -284,6 +284,50 @@ class TestYggdrasilAPI(unittest.TestCase):
             recall_res.json()["result"]["content"][0]["text"],
         )
 
+    def test_remote_mcp_secret_path_endpoint(self):
+        main.API_KEY = "admin-secret"
+        main.PUBLIC_READ_KEY = "public-twin-key"
+        mock_storage = make_mock_storage()
+        main.get_storage = lambda: mock_storage
+        client = TestClient(main.app)
+
+        # Wrong secret in path is rejected with 403
+        bad = client.post(
+            "/mcp/wrong-secret",
+            json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        )
+        self.assertEqual(bad.status_code, 403)
+
+        # Valid secret in path works without Authorization header
+        ok_init = client.post(
+            "/mcp/admin-secret",
+            json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        )
+        self.assertEqual(ok_init.status_code, 200)
+        self.assertEqual(
+            ok_init.json()["result"]["serverInfo"]["name"], "yggdrasil-cosmos-mcp"
+        )
+
+        # Tool call works via /mcp/{token}
+        ok_add = client.post(
+            "/mcp/admin-secret",
+            json={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "commit_to_memory",
+                    "arguments": {
+                        "tag": "chatgpt-plugin",
+                        "summary": "Connected via secret-path MCP URL.",
+                        "source_agent": "ChatGPT",
+                    },
+                },
+            },
+        )
+        self.assertEqual(ok_add.status_code, 200)
+        self.assertFalse(ok_add.json()["result"]["isError"])
+
 
 if __name__ == "__main__":
     unittest.main()

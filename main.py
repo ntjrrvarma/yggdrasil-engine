@@ -206,6 +206,15 @@ async def search_memories(
     }
 
 
+async def _dispatch_remote_mcp(payload: dict, raw_token: str):
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://yggdrasil") as client:
+        response = await handle_jsonrpc_message(payload, client=client, api_key=raw_token)
+    if response is None:
+        return Response(status_code=202)
+    return response
+
+
 @app.post("/mcp", summary="Remote Streamable HTTP MCP endpoint")
 async def remote_mcp_endpoint(
     payload: dict = Body(...),
@@ -214,9 +223,14 @@ async def remote_mcp_endpoint(
 ):
     """Handle MCP JSON-RPC 2.0 requests over HTTP for web and mobile AI connectors."""
     raw_token = api_key[7:] if api_key.startswith("Bearer ") else api_key
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://yggdrasil") as client:
-        response = await handle_jsonrpc_message(payload, client=client, api_key=raw_token)
-    if response is None:
-        return Response(status_code=202)
-    return response
+    return await _dispatch_remote_mcp(payload, raw_token)
+
+
+@app.post("/mcp/{token}", summary="Remote MCP endpoint with secret-path token")
+async def remote_mcp_secret_path_endpoint(
+    token: str,
+    payload: dict = Body(...),
+):
+    """Handle MCP JSON-RPC 2.0 requests when the client cannot send custom Bearer headers."""
+    resolve_read_scopes(f"Bearer {token}")
+    return await _dispatch_remote_mcp(payload, token)
